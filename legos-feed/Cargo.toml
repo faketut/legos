@@ -1,0 +1,12 @@
+[package]
+name = "legos-feed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "legos_feed"
+path = "src/lib.rs"
+
+[dependencies]
+legos-core = { path = "../legos-core" }

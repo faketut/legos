@@ -1,0 +1,20 @@
+[package]
+name = "legos-strategy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "legos_strategy"
+path = "src/lib.rs"
+
+[features]
+default = []
+# 启用真正的 Python 嵌入（需要 pyo3 与 Python 3.8+ 开发环境）：
+#   cargo build -p legos-strategy --features python
+python = ["dep:pyo3"]
+
+[dependencies]
+legos-core = { path = "../legos-core" }
+# auto-initialize：嵌入解释器时自动初始化 Python（标准做法）
+pyo3 = { version = "0.22", optional = true, features = ["auto-initialize"] }

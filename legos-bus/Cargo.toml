@@ -1,0 +1,12 @@
+[package]
+name = "legos-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "legos_bus"
+path = "src/lib.rs"
+
+[dependencies]
+legos-core = { path = "../legos-core" }

@@ -1,0 +1,26 @@
+[package]
+name = "legos-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "legos-app"
+path = "src/main.rs"
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
+
+[dependencies]
+legos-core = { path = "../legos-core" }
+legos-bus = { path = "../legos-bus" }
+legos-book = { path = "../legos-book" }
+legos-feed = { path = "../legos-feed" }
+legos-risk = { path = "../legos-risk" }
+legos-gateway = { path = "../legos-gateway" }
+legos-strategy = { path = "../legos-strategy" }
+core_affinity = "0.8"
+
+[dev-dependencies]
+criterion = "0.5"

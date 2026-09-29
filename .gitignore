@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# criterion 基准报告（可重新生成）
+target/criterion/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# 临时文件
+/tmp/

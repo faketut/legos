@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "legos-core",
+    "legos-bus",
+    "legos-book",
+    "legos-feed",
+    "legos-risk",
+    "legos-gateway",
+    "legos-strategy",
+    "legos-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["zerooverhead-hft contributors"]
+
+# Release profile tuned for latency: maximum optimization, single codegen unit
+# so cross-crate inlining (the "Legos" monomorphization story) actually happens.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
