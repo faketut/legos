@@ -10,6 +10,7 @@
 //! * 数量超过对手盘时部分成交（`PartiallyFilled`），并扣减该档剩余量。
 //!
 //! 报价表用固定 64 槽位数组实现，**零堆分配**。
+//! `send_order` 永不 panic：未知品种 / 零数量一律返回 `Rejected` 回执。
 
 use legos_core::{AckStatus, ExecutionGateway, OrderAck, OrderIntent, Side};
 
@@ -17,9 +18,9 @@ use legos_core::{AckStatus, ExecutionGateway, OrderAck, OrderIntent, Side};
 #[derive(Clone, Copy, Debug, Default)]
 struct SimQuote {
     bid: i64,
-    bid_qty: u64,
+    bid_qty: u32,
     ask: i64,
-    ask_qty: u64,
+    ask_qty: u32,
     valid: bool,
 }
 
@@ -27,7 +28,7 @@ const MAX_SYMBOLS: usize = 64;
 
 /// 内存撮合模拟器。
 pub struct SimulatedExchange {
-    quotes: [Option<(u32, SimQuote)>; MAX_SYMBOLS],
+    quotes: [Option<(u16, SimQuote)>; MAX_SYMBOLS],
     /// 每笔成交的固定滑点（tick），买单加、卖单减。
     slippage_ticks: i64,
     pub fills: u64,
@@ -45,7 +46,7 @@ impl SimulatedExchange {
     }
 
     /// 灌入某品种最新最优买卖报价（通常由账簿的 best_bid/best_ask 驱动）。
-    pub fn update_quote(&mut self, symbol_id: u32, bid: (i64, u64), ask: (i64, u64)) {
+    pub fn update_quote(&mut self, symbol_id: u16, bid: (i64, u32), ask: (i64, u32)) {
         let q = SimQuote {
             bid: bid.0,
             bid_qty: bid.1,
@@ -64,7 +65,7 @@ impl SimulatedExchange {
         // 槽位用尽：静默忽略（回测品种数远小于 64）。
     }
 
-    fn quote(&self, symbol_id: u32) -> Option<SimQuote> {
+    fn quote(&self, symbol_id: u16) -> Option<SimQuote> {
         self.quotes
             .iter()
             .flatten()
@@ -73,7 +74,7 @@ impl SimulatedExchange {
             .filter(|q| q.valid)
     }
 
-    fn quote_mut(&mut self, symbol_id: u32) -> Option<&mut SimQuote> {
+    fn quote_mut(&mut self, symbol_id: u16) -> Option<&mut SimQuote> {
         self.quotes
             .iter_mut()
             .flatten()
@@ -84,7 +85,7 @@ impl SimulatedExchange {
 }
 
 impl ExecutionGateway for SimulatedExchange {
-    fn on_quote(&mut self, symbol_id: u32, bid: Option<(i64, u64)>, ask: Option<(i64, u64)>) {
+    fn on_quote(&mut self, symbol_id: u16, bid: Option<(i64, u32)>, ask: Option<(i64, u32)>) {
         if let (Some(b), Some(a)) = (bid, ask) {
             self.update_quote(symbol_id, b, a);
         }
@@ -153,7 +154,7 @@ impl ExecutionGateway for SimulatedExchange {
 mod tests {
     use super::*;
 
-    fn buy_limit(price: i64, qty: u64) -> OrderIntent {
+    fn buy_limit(price: i64, qty: u32) -> OrderIntent {
         OrderIntent {
             client_order_id: 1,
             symbol_id: 1,

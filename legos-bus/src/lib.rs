@@ -10,4 +10,4 @@ mod shm;
 mod spsc;
 
 pub use shm::SharedMemoryBus;
-pub use spsc::SpscRingBuffer;
+pub use spsc::{CachePadded, SpscRingBuffer};

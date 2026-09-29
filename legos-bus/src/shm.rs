@@ -223,18 +223,10 @@ mod tests {
 
     #[test]
     fn tick_roundtrip_through_shm() {
-        use legos_core::{EventKind, Side, Tick};
+        use legos_core::{EventKind, MarketTick, Side};
         let name = unique_name("tick");
-        let bus = SharedMemoryBus::<Tick, 16>::create(&name, 0o600).unwrap();
-        let t = Tick {
-            symbol_id: 9,
-            price: 123_4567,
-            qty: 42,
-            side: Side::Ask,
-            kind: EventKind::Trade,
-            order_id: 5,
-            ts_ns: 999,
-        };
+        let bus = SharedMemoryBus::<MarketTick, 16>::create(&name, 0o600).unwrap();
+        let t = MarketTick::new(9, 123_4567, 42, Side::Ask, EventKind::Trade, 5, 999);
         assert!(bus.push(t));
         assert_eq!(bus.pop(), Some(t));
     }

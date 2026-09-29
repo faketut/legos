@@ -1,15 +1,18 @@
 //! CSV 行情文件接入（回测积木）。
 //!
-//! 文件格式（首行为表头）：
+//! 文件格式**契约**（首行为表头，列顺序锁定——`scripts/fetch_ticks.py`
+//! 等外部抓取脚本的输出必须与此 schema 严格一致，见 `legos-feed/SPEC.md`）：
 //!
 //! ```text
 //! symbol_id,side,price,qty,kind,ts_ns
 //! 1,B,1000000,100,ADD,1710000000000000000
 //! ```
 //!
+//! * `symbol_id`: u16 范围的整数；
 //! * `side`: `B` = 买，`A` = 卖；
 //! * `kind`: `ADD` / `CANCEL` / `TRADE`；
-//! * `price`: 整数 tick；`ts_ns`: 纳秒时间戳。
+//! * `price`: 整数 tick；`qty`: u32 范围；`ts_ns`: 纳秒时间戳；
+//! * CSV 不携带订单号，`order_id` 统一填 0。
 //!
 //! 解析失败的行会被**跳过**（行号可通过 [`CsvFileFeed::lines_read`] /
 //! [`CsvFileFeed::lines_skipped`] 观察），`next_event` 在 EOF 时永久返回 `None`。
@@ -18,7 +21,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use legos_core::{EventKind, MarketDataFeed, Side, Tick};
+use legos_core::{EventKind, MarketDataFeed, MarketTick, Side};
 
 /// 逐行解析 CSV 的行情 feed。
 pub struct CsvFileFeed {
@@ -53,16 +56,17 @@ impl CsvFileFeed {
         self.lines_skipped
     }
 
-    fn parse_line(line: &str) -> Option<Tick> {
+    fn parse_line(line: &str) -> Option<MarketTick> {
         let mut f = line.split(',');
         let symbol_id: u32 = f.next()?.trim().parse().ok()?;
+        let symbol_id = u16::try_from(symbol_id).ok()?;
         let side = match f.next()?.trim() {
             "B" => Side::Bid,
             "A" => Side::Ask,
             _ => return None,
         };
         let price: i64 = f.next()?.trim().parse().ok()?;
-        let qty: u64 = f.next()?.trim().parse().ok()?;
+        let qty: u32 = f.next()?.trim().parse().ok()?;
         let kind = match f.next()?.trim() {
             "ADD" => EventKind::Add,
             "CANCEL" => EventKind::Cancel,
@@ -70,20 +74,12 @@ impl CsvFileFeed {
             _ => return None,
         };
         let ts_ns: u64 = f.next()?.trim().parse().ok()?;
-        Some(Tick {
-            symbol_id,
-            price,
-            qty,
-            side,
-            kind,
-            order_id: 0, // CSV 格式不携带订单号；需要时可用行号回填
-            ts_ns,
-        })
+        Some(MarketTick::new(symbol_id, price, qty, side, kind, 0, ts_ns))
     }
 }
 
 impl MarketDataFeed for CsvFileFeed {
-    fn next_event(&mut self) -> Option<Tick> {
+    fn next_event(&mut self) -> Option<MarketTick> {
         loop {
             self.buf.clear();
             let n = self.reader.read_line(&mut self.buf).ok()?;
@@ -133,11 +129,12 @@ mod tests {
         let mut feed = CsvFileFeed::open(&path).unwrap();
         let t1 = feed.next_event().unwrap();
         assert_eq!(t1.symbol_id, 1);
-        assert_eq!(t1.side, Side::Bid);
-        assert_eq!(t1.kind, EventKind::Add);
+        assert_eq!(t1.side(), Side::Bid);
+        assert_eq!(t1.kind(), EventKind::Add);
         assert_eq!((t1.price, t1.qty, t1.ts_ns), (1000000, 100, 10));
+        assert_eq!(t1.order_id, 0, "CSV 不携带订单号");
         let t2 = feed.next_event().unwrap();
-        assert_eq!(t2.kind, EventKind::Trade);
+        assert_eq!(t2.kind(), EventKind::Trade);
         assert_eq!(feed.next_event(), None);
         assert_eq!(feed.next_event(), None, "EOF 后保持 None");
         assert_eq!(feed.lines_read(), 2);
@@ -157,9 +154,22 @@ mod tests {
         let mut feed = CsvFileFeed::open(&path).unwrap();
         assert!(feed.next_event().is_some());
         let t = feed.next_event().unwrap();
-        assert_eq!(t.kind, EventKind::Cancel);
+        assert_eq!(t.kind(), EventKind::Cancel);
         assert_eq!(feed.next_event(), None);
         assert_eq!(feed.lines_skipped(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rejects_out_of_range_symbol_id() {
+        let path = write_temp_csv(
+            "range",
+            "symbol_id,side,price,qty,kind,ts_ns\n\
+             70000,B,1000000,100,ADD,10\n",
+        );
+        let mut feed = CsvFileFeed::open(&path).unwrap();
+        assert_eq!(feed.next_event(), None);
+        assert_eq!(feed.lines_skipped(), 1);
         std::fs::remove_file(&path).ok();
     }
 

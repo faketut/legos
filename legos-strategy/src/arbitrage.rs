@@ -20,15 +20,15 @@ use legos_core::{OrderIntent, Side, TradingStrategy};
 
 pub struct ArbitrageStrategy {
     threshold_ticks: i64,
-    order_qty: u64,
-    symbol_id: u32,
+    order_qty: u32,
+    symbol_id: u16,
     next_id: u64,
     venue_b_bid: Option<i64>,
     venue_b_ask: Option<i64>,
 }
 
 impl ArbitrageStrategy {
-    pub fn new(symbol_id: u32, threshold_ticks: i64, order_qty: u64) -> Self {
+    pub fn new(symbol_id: u16, threshold_ticks: i64, order_qty: u32) -> Self {
         Self {
             threshold_ticks,
             order_qty,
@@ -40,7 +40,7 @@ impl ArbitrageStrategy {
     }
 
     /// 同步场所 B 的最新最优报价（每 tick 调用一次）。
-    pub fn update_venue_b(&mut self, bid: Option<(i64, u64)>, ask: Option<(i64, u64)>) {
+    pub fn update_venue_b(&mut self, bid: Option<(i64, u32)>, ask: Option<(i64, u32)>) {
         self.venue_b_bid = bid.map(|(p, _)| p);
         self.venue_b_ask = ask.map(|(p, _)| p);
     }
@@ -62,8 +62,8 @@ impl TradingStrategy for ArbitrageStrategy {
     /// `bid`/`ask` 为场所 A 的报价。
     fn on_tick(
         &mut self,
-        bid: Option<(i64, u64)>,
-        ask: Option<(i64, u64)>,
+        bid: Option<(i64, u32)>,
+        ask: Option<(i64, u32)>,
         _mid: Option<i64>,
     ) -> Option<OrderIntent> {
         let (a_bid, a_ask) = (bid?.0, ask?.0);

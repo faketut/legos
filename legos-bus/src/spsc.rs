@@ -1,8 +1,17 @@
 //! 单生产者 / 单消费者（SPSC）无锁环形队列。
 //!
-//! 内存布局：`head`（消费者下标）、`tail`（生产者下标）两个原子计数器，
-//! 加一段 `[MaybeUninit<T>; CAP]` 定长数组。整个结构体可以放在栈上、
-//! 静态区，或原样搬进共享内存（见 [`crate::SharedMemoryBus`]）。
+//! 内存布局契约（见 `legos-bus/SPEC.md`）：
+//!
+//! ```text
+//! 偏移            字段
+//! 0     64B     head: CachePadded<AtomicUsize>   消费者下标（独占缓存行）
+//! 64    64B     tail: CachePadded<AtomicUsize>   生产者下标（独占缓存行）
+//! 128   CAP*T   buf: [MaybeUninit<T>; CAP]       定长槽位数组
+//! ```
+//!
+//! `head` 与 `tail` 各自 `#[repr(align(64))]` 独占一个缓存行——生产者只写
+//! `tail`、消费者只写 `head`，两者永不在同一缓存行上互相 invalidate
+//! （防伪共享）。整个结构体可原样搬进共享内存（见 [`crate::SharedMemoryBus`]）。
 //!
 //! 同步协议（经典 SPSC，无锁、无等待）:
 //!
@@ -18,10 +27,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use legos_core::MessageBus;
 
-/// SPSC 无锁环形队列。`T: Copy`（无 `Drop`，槽位复用 sound），`CAP` 为容量。
+/// 把一个值独占一个缓存行。`#[repr(align(64))]` 保证地址 64 字节对齐、
+///
+/// 结构体大小至少 64 字节——相邻的两个 `CachePadded` 不可能落在同一缓存行。
+#[derive(Debug)]
+#[repr(align(64))]
+pub struct CachePadded<T> {
+    value: T,
+}
+
+impl<T> CachePadded<T> {
+    pub const fn new(value: T) -> Self {
+        Self { value }
+    }
+    pub fn get(&self) -> &T {
+        &self.value
+    }
+}
+
+/// SPSC 无锁环形队列。`T: Copy`（无 `Drop`，槽位复用 sound），`CAP` 为槽位数。
 pub struct SpscRingBuffer<T: Copy, const CAP: usize> {
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
     buf: [MaybeUninit<T>; CAP],
 }
 
@@ -30,8 +57,8 @@ impl<T: Copy, const CAP: usize> SpscRingBuffer<T, CAP> {
     pub const fn new() -> Self {
         assert!(CAP > 0, "SpscRingBuffer capacity must be > 0");
         Self {
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
             buf: [MaybeUninit::uninit(); CAP],
         }
     }
@@ -43,8 +70,8 @@ impl<T: Copy, const CAP: usize> SpscRingBuffer<T, CAP> {
 
     /// 当前队列中元素个数（并发调用者看到的值是近似的，仅用于监控）。
     pub fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.get().load(Ordering::Relaxed);
+        let head = self.head.get().load(Ordering::Relaxed);
         tail.wrapping_sub(head)
     }
 
@@ -54,9 +81,9 @@ impl<T: Copy, const CAP: usize> SpscRingBuffer<T, CAP> {
 
     /// 生产者：入队。队满返回 `false`（不阻塞、不分配、不覆盖旧数据）。
     pub fn push(&self, item: T) -> bool {
-        let tail = self.tail.load(Ordering::Relaxed);
+        let tail = self.tail.get().load(Ordering::Relaxed);
         // Acquire：与消费者 Release 发布 head 配对，确保看到槽位已空闲。
-        let head = self.head.load(Ordering::Acquire);
+        let head = self.head.get().load(Ordering::Acquire);
         if tail.wrapping_sub(head) == CAP {
             return false; // 满
         }
@@ -69,15 +96,15 @@ impl<T: Copy, const CAP: usize> SpscRingBuffer<T, CAP> {
         }
         // Release：槽位写入先于 tail 发布，消费者 Acquire 读到新 tail
         // 时一定能看到完整写入。
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        self.tail.get().store(tail.wrapping_add(1), Ordering::Release);
         true
     }
 
     /// 消费者：出队。队空返回 `None`。
     pub fn pop(&self) -> Option<T> {
-        let head = self.head.load(Ordering::Relaxed);
+        let head = self.head.get().load(Ordering::Relaxed);
         // Acquire：与生产者 Release 发布 tail 配对，确保看到槽位完整写入。
-        let tail = self.tail.load(Ordering::Acquire);
+        let tail = self.tail.get().load(Ordering::Acquire);
         if head == tail {
             return None; // 空
         }
@@ -85,7 +112,7 @@ impl<T: Copy, const CAP: usize> SpscRingBuffer<T, CAP> {
         // `assume_init_read` 按位复制出 T（T: Copy），槽位随后被生产者覆盖。
         let item = unsafe { self.buf[head % CAP].assume_init_read() };
         // Release：读出先于 head 发布，生产者看到新 head 后可安全复用槽位。
-        self.head.store(head.wrapping_add(1), Ordering::Release);
+        self.head.get().store(head.wrapping_add(1), Ordering::Release);
         Some(item)
     }
 }
@@ -113,25 +140,31 @@ impl<T: Copy, const CAP: usize> MessageBus for SpscRingBuffer<T, CAP> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legos_core::{EventKind, Side, Tick};
+    use legos_core::{EventKind, MarketTick, Side};
     use std::sync::Arc;
     use std::thread;
 
-    fn tick(id: u64) -> Tick {
-        Tick {
-            symbol_id: 1,
-            price: 100_0000 + id as i64,
-            qty: id,
-            side: Side::Bid,
-            kind: EventKind::Add,
-            order_id: id,
-            ts_ns: id,
-        }
+    fn tick(id: u32) -> MarketTick {
+        MarketTick::new(1, 100_0000 + id as i64, id, Side::Bid, EventKind::Add, id, id as u64)
+    }
+
+    #[test]
+    fn head_tail_no_false_sharing() {
+        // 数据契约：head / tail 各自独占 64 字节缓存行。
+        assert_eq!(std::mem::size_of::<CachePadded<AtomicUsize>>(), 64);
+        assert_eq!(std::mem::align_of::<CachePadded<AtomicUsize>>(), 64);
+        let q = SpscRingBuffer::<u64, 8>::new();
+        let head_addr = q.head.get() as *const _ as usize;
+        let tail_addr = q.tail.get() as *const _ as usize;
+        assert!(
+            head_addr.abs_diff(tail_addr) >= 64,
+            "head/tail 必须分属不同缓存行"
+        );
     }
 
     #[test]
     fn fifo_order() {
-        let q = SpscRingBuffer::<Tick, 16>::new();
+        let q = SpscRingBuffer::<MarketTick, 16>::new();
         for i in 0..10 {
             assert!(q.push(tick(i)));
         }

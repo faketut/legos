@@ -1,26 +1,30 @@
 //! L2 扁平数组账簿：为缓存命中率而生的定价引擎。
 //!
-//! 布局：买盘 `[(price, qty); LEVELS]` 按价格**降序**、卖盘按价格**升序**，
-//! 全部挤在两个连续数组里。一次行情事件的处理流程：
+//! 布局契约（见 `legos-book/SPEC.md`）：
+//!
+//! * 买盘 `[(i64, u32); LEVELS]` 价格**降序**、`bids[0]` 即最优买价；
+//! * 卖盘 `[(i64, u32); LEVELS]` 价格**升序**、`asks[0]` 即最优卖价；
+//! * 两个连续数组 + 有效长度，全部栈上，`apply` 全程**零堆分配**。
+//!
+//! 事件处理流程：
 //!
 //! 1. 在对应数组的**有效前缀**上做二分查找定位价格档（`O(log LEVELS)`）；
 //! 2. 命中则原地加减数量；未命中则用 `copy_within` 平移插入（`O(LEVELS)`，
 //!    但 `LEVELS` 是编译期常量且很小，实测就是几条向量化内存搬运指令）；
 //! 3. 数量归零的档位同样平移删除，保持数组紧凑。
 //!
-//! 全程**零堆分配**：没有 `Vec`、没有 `Box`，`apply` 内只有栈上操作。
 //! 深度截断策略：数组满时，更差的档位直接丢弃（L2 场景下可接受，
 //! 需要全深度请换 `L3MapBook`）。
 
-use legos_core::{EventKind, OrderBook, Side, Tick};
+use legos_core::{EventKind, MarketTick, OrderBook, Side};
 
 /// L2 扁平账簿。`LEVELS` 为每侧保留的最大档位数（典型 5 / 10）。
 #[derive(Clone, Copy, Debug)]
 pub struct L2FlatArrayBook<const LEVELS: usize> {
     /// 买盘：价格降序，`bids[0]` 即最优买价。
-    bids: [(i64, u64); LEVELS],
+    bids: [(i64, u32); LEVELS],
     /// 卖盘：价格升序，`asks[0]` 即最优卖价。
-    asks: [(i64, u64); LEVELS],
+    asks: [(i64, u32); LEVELS],
     bid_len: usize,
     ask_len: usize,
 }
@@ -41,7 +45,7 @@ impl<const LEVELS: usize> L2FlatArrayBook<LEVELS> {
     /// 买盘降序、卖盘升序，统一用 comparator 适配。返回 `Ok(idx)` 表示命中，
     /// `Err(idx)` 表示应插入的位置。
     #[inline]
-    fn find(levels: &[(i64, u64)], len: usize, price: i64, ascending: bool) -> Result<usize, usize> {
+    fn find(levels: &[(i64, u32)], len: usize, price: i64, ascending: bool) -> Result<usize, usize> {
         levels[..len].binary_search_by(|&(p, _)| {
             if ascending {
                 p.cmp(&price)
@@ -69,7 +73,7 @@ impl<const LEVELS: usize> L2FlatArrayBook<LEVELS> {
                     levels.copy_within(idx + 1..*len, idx);
                     *len -= 1;
                 } else {
-                    levels[idx].1 = new_qty as u64;
+                    levels[idx].1 = new_qty as u32;
                 }
             }
             Err(idx) => {
@@ -82,11 +86,11 @@ impl<const LEVELS: usize> L2FlatArrayBook<LEVELS> {
                     }
                     // 更优的新档：插入并挤掉最差一档，长度不变。
                     levels.copy_within(idx..LEVELS - 1, idx + 1);
-                    levels[idx] = (price, delta as u64);
+                    levels[idx] = (price, delta as u32);
                 } else {
                     // 插入：idx 及之后的元素后移一位。
                     levels.copy_within(idx..*len, idx + 1);
-                    levels[idx] = (price, delta as u64);
+                    levels[idx] = (price, delta as u32);
                     *len += 1;
                 }
             }
@@ -107,17 +111,17 @@ impl<const LEVELS: usize> Default for L2FlatArrayBook<LEVELS> {
 
 impl<const LEVELS: usize> OrderBook for L2FlatArrayBook<LEVELS> {
     #[inline]
-    fn apply(&mut self, ev: &Tick) {
-        match ev.kind {
-            EventKind::Add => self.add_qty(ev.side, ev.price, ev.qty as i64),
-            EventKind::Cancel => self.add_qty(ev.side, ev.price, -(ev.qty as i64)),
+    fn apply(&mut self, ev: &MarketTick) {
+        match ev.kind() {
+            EventKind::Add => self.add_qty(ev.side(), ev.price, ev.qty as i64),
+            EventKind::Cancel => self.add_qty(ev.side(), ev.price, -(ev.qty as i64)),
             // 成交吃掉盘口流动性：按事件方向扣减对应档位。
-            EventKind::Trade => self.add_qty(ev.side, ev.price, -(ev.qty as i64)),
+            EventKind::Trade => self.add_qty(ev.side(), ev.price, -(ev.qty as i64)),
         }
     }
 
     #[inline]
-    fn best_bid(&self) -> Option<(i64, u64)> {
+    fn best_bid(&self) -> Option<(i64, u32)> {
         if self.bid_len > 0 {
             Some(self.bids[0])
         } else {
@@ -126,7 +130,7 @@ impl<const LEVELS: usize> OrderBook for L2FlatArrayBook<LEVELS> {
     }
 
     #[inline]
-    fn best_ask(&self) -> Option<(i64, u64)> {
+    fn best_ask(&self) -> Option<(i64, u32)> {
         if self.ask_len > 0 {
             Some(self.asks[0])
         } else {
@@ -139,16 +143,8 @@ impl<const LEVELS: usize> OrderBook for L2FlatArrayBook<LEVELS> {
 mod tests {
     use super::*;
 
-    fn add(side: Side, price: i64, qty: u64) -> Tick {
-        Tick {
-            symbol_id: 1,
-            price,
-            qty,
-            side,
-            kind: EventKind::Add,
-            order_id: price as u64,
-            ts_ns: 0,
-        }
+    fn add(side: Side, price: i64, qty: u32) -> MarketTick {
+        MarketTick::new(1, price, qty, side, EventKind::Add, price as u32, 0)
     }
 
     #[test]
@@ -178,17 +174,11 @@ mod tests {
     fn cancel_and_trade_reduce_levels() {
         let mut b = L2FlatArrayBook::<10>::new();
         b.apply(&add(Side::Ask, 100_0000, 100));
-        b.apply(&Tick {
-            kind: EventKind::Cancel,
-            qty: 40,
-            ..add(Side::Ask, 100_0000, 0)
-        });
+        let cancel = MarketTick::new(1, 100_0000, 40, Side::Ask, EventKind::Cancel, 1, 0);
+        b.apply(&cancel);
         assert_eq!(b.best_ask(), Some((100_0000, 60)));
-        b.apply(&Tick {
-            kind: EventKind::Trade,
-            qty: 60,
-            ..add(Side::Ask, 100_0000, 0)
-        });
+        let trade = MarketTick::new(1, 100_0000, 60, Side::Ask, EventKind::Trade, 2, 0);
+        b.apply(&trade);
         assert_eq!(b.best_ask(), None, "数量归零档位应被删除");
     }
 

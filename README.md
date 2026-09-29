@@ -12,10 +12,10 @@
 
 ```rust
 // 回测装配
-Pipeline<CsvFileFeed, SpscRingBuffer<Tick, 4096>, L2FlatArrayBook<10>,
+Pipeline<CsvFileFeed, SpscRingBuffer<MarketTick, 4096>, L2FlatArrayBook<10>,
          MarketMakerStrategy, PassThroughRisk, SimulatedExchange>
 // 实盘装配：只换泛型参数，其余代码一字不动
-Pipeline<NativeItchParser, SharedMemoryBus<Tick, 4096>, L3MapBook,
+Pipeline<NativeItchParser, SharedMemoryBus<MarketTick, 4096>, L3MapBook,
          MarketMakerStrategy, HardLimitRisk, FixProtocolGateway>
 ```
 
@@ -25,16 +25,16 @@ Pipeline<NativeItchParser, SharedMemoryBus<Tick, 4096>, L3MapBook,
 
 | Phase | 内容 | 交付 crate |
 |-------|------|-----------|
-| 1. 数据总线与基础设施 | 先确立核心数据结构 `Tick`、`Order`（定长、`Copy`，热路径零堆分配），再实现 `SpscRingBuffer`（手写无锁队列：`MaybeUninit` 数组 + 原子 `head`/`tail`）和 `SharedMemoryBus`（Linux 共享内存跨进程）。无锁队列的并发安全是全系统的血管，最先跑通 | `legos-core`, `legos-bus` |
+| 1. 数据总线与基础设施 | 先确立核心数据结构 `MarketTick`（32 字节定长、`Copy`，热路径零堆分配）、`Order`，再实现 `SpscRingBuffer`（手写无锁队列：`MaybeUninit` 数组 + 原子 `head`/`tail`）和 `SharedMemoryBus`（Linux 共享内存跨进程）。无锁队列的并发安全是全系统的血管，最先跑通 | `legos-core`, `legos-bus` |
 | 2. 高频内存账簿 | `L2FlatArrayBook`：固定连续数组上的**零堆分配二分插入/查找**维护价格梯队，L1/L2 缓存友好；`L3MapBook`：按订单 ID 的树状结构，用于深度排队分析 | `legos-book` |
-| 3. 外围网关与仿真器 | `CsvFileFeed`（回测读文件）、`SimulatedExchange`（回测内存撮合）、`NativeItchParser`（实盘 NASDAQ ITCH 5.0 二进制解析）、`FixProtocolGateway`（实盘 FIX 4.4）。解析出的 Tick 丢进总线驱动账簿，形成输入闭环 | `legos-feed`, `legos-gateway`, `legos-risk` |
+| 3. 外围网关与仿真器 | `CsvFileFeed`（回测读文件）、`SimulatedExchange`（回测内存撮合）、`NativeItchParser`（实盘 NASDAQ ITCH 5.0 二进制解析）、`FixProtocolGateway`（实盘 FIX 4.4）。解析出的 MarketTick 丢进总线驱动账簿，形成输入闭环 | `legos-feed`, `legos-gateway`, `legos-risk` |
 | 4. 策略逻辑与泛型管线编织 | `MarketMakerStrategy` 做市、`ArbitrageStrategy` 跨场所套利；`Pipeline` 主循环用一行泛型声明把 6 大组件在编译期织成直线流水线；`core_affinity` 把主循环绑定到指定物理 CPU 核心；`criterion` 全链路延迟基准 | `legos-strategy`, `legos-app` |
 
 ## Crate 地图
 
 ```
 legos/
-├── legos-core      # 地基：Tick/Order/OrderIntent/OrderAck（定长 Copy）+ 六大 trait
+├── legos-core      # 地基：MarketTick/Order/OrderIntent/OrderAck（定长 Copy）+ 六大 trait + 订单状态机
 │                     # MarketDataFeed / MessageBus / OrderBook / TradingStrategy /
 │                     # PreTradeRisk / ExecutionGateway —— 热路径无 dyn、无堆分配
 ├── legos-bus       # Phase 1：SpscRingBuffer<T: Copy, const CAP: usize>（原子 head/tail）
@@ -62,7 +62,7 @@ legos/
 // 回测 → 实盘：换三个泛型参数
 let mut pipe: Pipeline<
     CsvFileFeed,
-    SpscRingBuffer<Tick, 4096>,
+    SpscRingBuffer<MarketTick, 4096>,
     L3MapBook,            // ← L2FlatArrayBook<10> 换成 L3MapBook
     MarketMakerStrategy,
     HardLimitRisk,        // ← PassThroughRisk 换成 HardLimitRisk
@@ -100,7 +100,7 @@ cargo build -p legos-strategy --features python
 | 基准 | 含义 | 结果 |
 |------|------|------|
 | `spsc_ring_buffer/push_pop_tick` | 无锁队列一推一取 | ~17.4 ns |
-| `l2_book/apply_tick` | L2 账簿处理一个 Tick | ~21.7 ns |
+| `l2_book/apply_tick` | L2 账簿处理一个 MarketTick | ~21.7 ns |
 | `full_pipeline/tick_to_fill_1000` | 全链路 1000 tick（feed→bus→book→strategy→risk→gateway） | ~47.8 µs（≈47.8 ns/tick） |
 
 > 注：以上为开发机上的相对参考值，实盘延迟以生产环境实测为准。

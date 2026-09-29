@@ -2,20 +2,26 @@
 //!
 //! ```text
 //! feed.next_event() → bus.push() → bus.pop() → book.apply()
-//!     → strategy.on_tick() → risk.check() → gateway.send_order()
+//!     → strategy.on_tick() → risk.check_order() → gateway.send_order()
 //! ```
 //!
 //! `Pipeline` 的 6 个类型参数全部是**泛型**（不是 `dyn`）：
 //! `cargo build` 做单态化时把每一层调用直接内联，运行时不存在任何
 //! 虚函数跳转——这就是「Legos 编译期积木」名称的由来。
+//!
+//! 每个 `OrderIntent` 都配一个 [`TrackedOrder`](legos_core::TrackedOrder)
+//! 走完状态机：`Created → PendingNew → {Accepted|Filled|PartiallyFilled|Rejected}`，
+//! 任何非法转换被计数到 `PipelineStats.illegal_transitions`（正常应恒为 0）。
+//!
+//! 行为契约见 `legos-app/SPEC.md`。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use legos_book::{L2FlatArrayBook, L3MapBook};
 use legos_bus::SpscRingBuffer;
 use legos_core::{
-    AckStatus, ExecutionGateway, MarketDataFeed, MessageBus, OrderBook, PreTradeRisk, Tick,
-    TradingStrategy,
+    AckStatus, ExecutionGateway, MarketDataFeed, MarketTick, MessageBus, OrderBook, OrderState,
+    PreTradeRisk, TrackedOrder, TradingStrategy,
 };
 use legos_feed::CsvFileFeed;
 use legos_gateway::{FixProtocolGateway, SimulatedExchange};
@@ -48,12 +54,14 @@ pub struct PipelineStats {
     pub rejected_by_risk: u64,
     pub rejected_by_gateway: u64,
     pub fills: u64,
+    /// 状态机非法转换计数（契约要求恒为 0；非 0 即实现 bug）。
+    pub illegal_transitions: u64,
 }
 
 impl<F, B, Bk, S, R, G> Pipeline<F, B, Bk, S, R, G>
 where
     F: MarketDataFeed,
-    B: MessageBus<Item = Tick>,
+    B: MessageBus<Item = MarketTick>,
     Bk: OrderBook,
     S: TradingStrategy,
     R: PreTradeRisk,
@@ -72,7 +80,7 @@ where
 
     /// 处理单个 tick 的完整链路（内联热点，`#[inline]` 助单态化消除调用）。
     #[inline]
-    fn on_tick(&mut self, ev: Tick, stats: &mut PipelineStats) {
+    fn on_tick(&mut self, ev: MarketTick, stats: &mut PipelineStats) {
         stats.ticks += 1;
         self.book.apply(&ev);
         let bid = self.book.best_bid();
@@ -83,17 +91,45 @@ where
         if let Some(mut intent) = self.strategy.on_tick(bid, ask, mid) {
             stats.intents += 1;
             intent.ts_ns = now_ns(); // 管线统一打戳，供风控做速率统计
-            match self.risk.check(&intent) {
+            let mut tracked = TrackedOrder::new(intent.client_order_id);
+            match self.risk.check_order(&intent) {
                 Ok(()) => {
+                    // Created → PendingNew
+                    if tracked.advance(OrderState::PendingNew).is_err() {
+                        stats.illegal_transitions += 1;
+                    }
                     let ack = self.gateway.send_order(&intent);
                     stats.sent += 1;
-                    match ack.status {
-                        AckStatus::Filled | AckStatus::PartiallyFilled => stats.fills += 1,
-                        AckStatus::Rejected => stats.rejected_by_gateway += 1,
-                        AckStatus::Accepted => {}
+                    let next = match ack.status {
+                        AckStatus::Accepted => OrderState::Accepted,
+                        AckStatus::Filled => {
+                            stats.fills += 1;
+                            OrderState::Filled
+                        }
+                        AckStatus::PartiallyFilled => {
+                            stats.fills += 1;
+                            OrderState::PartiallyFilled
+                        }
+                        AckStatus::Rejected => {
+                            stats.rejected_by_gateway += 1;
+                            OrderState::Rejected
+                        }
+                    };
+                    // PendingNew → {Accepted, Filled, PartiallyFilled, Rejected}
+                    if tracked.advance(next).is_err() {
+                        stats.illegal_transitions += 1;
+                    }
+                    // 同步管线中订单在一个 tick 内走完可观测生命周期；
+                    // Accepted 在此为观察终点（实盘中后续由成交回报继续推进）。
+                    debug_assert_eq!(tracked.state(), next);
+                }
+                Err(_reason) => {
+                    stats.rejected_by_risk += 1;
+                    // Created → Rejected
+                    if tracked.advance(OrderState::Rejected).is_err() {
+                        stats.illegal_transitions += 1;
                     }
                 }
-                Err(_) => stats.rejected_by_risk += 1,
             }
         }
     }
@@ -181,7 +217,7 @@ fn main() {
     // ---- 回测装配：CsvFileFeed + SpscRingBuffer + L2FlatArrayBook<10>
     // ----            + MarketMakerStrategy + PassThroughRisk + SimulatedExchange
     let feed = CsvFileFeed::open(SAMPLE_CSV).expect("示例 CSV 缺失");
-    let bus = SpscRingBuffer::<Tick, 4096>::new();
+    let bus = SpscRingBuffer::<MarketTick, 4096>::new();
     let book = L2FlatArrayBook::<10>::new();
     let strategy = MarketMakerStrategy::new(1, 200, 0, 100);
     let risk = PassThroughRisk;
@@ -200,7 +236,7 @@ fn main() {
 #[allow(dead_code)]
 fn _demo_swap_bricks_at_compile_time() {
     let feed = CsvFileFeed::open(SAMPLE_CSV).expect("示例 CSV 缺失");
-    let bus = SpscRingBuffer::<Tick, 4096>::new();
+    let bus = SpscRingBuffer::<MarketTick, 4096>::new();
     let book = L3MapBook::new(); // ← 把 L2FlatArrayBook<10> 换成 L3MapBook
     let strategy = MarketMakerStrategy::new(1, 200, 0, 100);
     let risk = HardLimitRisk::new(10_000_000_000, 10_000, 1_000); // ← 换成实盘风控
@@ -208,7 +244,7 @@ fn _demo_swap_bricks_at_compile_time() {
 
     let mut pipe: Pipeline<
         CsvFileFeed,
-        SpscRingBuffer<Tick, 4096>,
+        SpscRingBuffer<MarketTick, 4096>,
         L3MapBook,
         MarketMakerStrategy,
         HardLimitRisk,
@@ -221,40 +257,62 @@ fn _demo_swap_bricks_at_compile_time() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legos_core::{EventKind, Side};
+    use legos_core::{EventKind, OrderIntent, Side};
 
     /// 内存 feed：测试/基准用的确定性行情源。
     pub struct VecFeed {
-        ticks: Vec<Tick>,
+        ticks: Vec<MarketTick>,
         pos: usize,
     }
 
     impl VecFeed {
-        pub fn new(ticks: Vec<Tick>) -> Self {
+        pub fn new(ticks: Vec<MarketTick>) -> Self {
             Self { ticks, pos: 0 }
         }
     }
 
     impl MarketDataFeed for VecFeed {
-        fn next_event(&mut self) -> Option<Tick> {
+        fn next_event(&mut self) -> Option<MarketTick> {
             let t = *self.ticks.get(self.pos)?;
             self.pos += 1;
             Some(t)
         }
     }
 
-    fn sample_ticks(n: usize) -> Vec<Tick> {
-        (0..n as u64)
-            .map(|i| Tick {
-                symbol_id: 1,
-                price: 100_0000 + (i % 20) as i64 * 100,
-                qty: 10,
-                side: if i % 2 == 0 { Side::Bid } else { Side::Ask },
-                kind: EventKind::Add,
-                order_id: i,
-                ts_ns: i,
+    fn sample_ticks(n: usize) -> Vec<MarketTick> {
+        (0..n as u32)
+            .map(|i| {
+                MarketTick::new(
+                    1,
+                    100_0000 + (i % 20) as i64 * 100,
+                    10,
+                    if i % 2 == 0 { Side::Bid } else { Side::Ask },
+                    EventKind::Add,
+                    i,
+                    i as u64,
+                )
             })
             .collect()
+    }
+
+    /// Mock 风控：记录 `check_order` 调用次数，可选全拒。
+    ///
+    /// Spec-Based Testing：验证管线对 `PreTradeRisk` trait 的调用契约——
+    /// 每个 intent 恰好调用一次 `check_order`，且拒绝时订单不送网关。
+    struct CountingRisk {
+        calls: u64,
+        reject_all: bool,
+    }
+
+    impl PreTradeRisk for CountingRisk {
+        fn check_order(&mut self, _order: &OrderIntent) -> Result<(), &'static str> {
+            self.calls += 1;
+            if self.reject_all {
+                Err(legos_core::REJECT_QTY_EXCEEDED)
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -262,7 +320,7 @@ mod tests {
         let feed = VecFeed::new(sample_ticks(200));
         let mut pipe = Pipeline::new(
             feed,
-            SpscRingBuffer::<Tick, 1024>::new(),
+            SpscRingBuffer::<MarketTick, 1024>::new(),
             L2FlatArrayBook::<10>::new(),
             MarketMakerStrategy::new(1, 200, 0, 10),
             PassThroughRisk,
@@ -273,6 +331,51 @@ mod tests {
         assert!(stats.intents > 0, "做市策略应产生交易意图");
         assert!(stats.fills > 0, "模拟撮合应产生 Fill（on_quote 持续刷新盘口）");
         assert_eq!(stats.rejected_by_risk, 0);
+        assert_eq!(
+            stats.illegal_transitions, 0,
+            "状态机非法转换必须为 0"
+        );
+    }
+
+    #[test]
+    fn risk_called_exactly_once_per_intent() {
+        let feed = VecFeed::new(sample_ticks(50));
+        let mut pipe = Pipeline::new(
+            feed,
+            SpscRingBuffer::<MarketTick, 1024>::new(),
+            L2FlatArrayBook::<10>::new(),
+            MarketMakerStrategy::new(1, 200, 0, 10),
+            CountingRisk {
+                calls: 0,
+                reject_all: false,
+            },
+            SimulatedExchange::new(1),
+        );
+        let stats = pipe.run();
+        assert_eq!(pipe.risk.calls, stats.intents, "每个 intent 恰好一次 check_order");
+        assert!(stats.intents > 0);
+        assert_eq!(stats.illegal_transitions, 0);
+    }
+
+    #[test]
+    fn risk_rejection_short_circuits_gateway() {
+        let feed = VecFeed::new(sample_ticks(50));
+        let mut pipe = Pipeline::new(
+            feed,
+            SpscRingBuffer::<MarketTick, 1024>::new(),
+            L2FlatArrayBook::<10>::new(),
+            MarketMakerStrategy::new(1, 200, 0, 10),
+            CountingRisk {
+                calls: 0,
+                reject_all: true,
+            },
+            SimulatedExchange::new(1),
+        );
+        let stats = pipe.run();
+        assert_eq!(stats.rejected_by_risk, stats.intents);
+        assert_eq!(stats.sent, 0, "被风控拦截的订单不得送网关");
+        assert_eq!(pipe.gateway.fills, 0);
+        assert_eq!(stats.illegal_transitions, 0);
     }
 
     #[test]
@@ -281,7 +384,7 @@ mod tests {
         let feed = VecFeed::new(sample_ticks(50));
         let mut pipe = Pipeline::new(
             feed,
-            SpscRingBuffer::<Tick, 1024>::new(),
+            SpscRingBuffer::<MarketTick, 1024>::new(),
             L2FlatArrayBook::<10>::new(),
             MarketMakerStrategy::new(1, 200, 0, 10),
             HardLimitRisk::new(1, 10, 1_000_000), // max_notional=1，几乎全拒
@@ -290,6 +393,7 @@ mod tests {
         let stats = pipe.run();
         assert!(stats.rejected_by_risk > 0);
         assert_eq!(stats.sent, 0);
+        assert_eq!(stats.illegal_transitions, 0);
     }
 
     #[test]
@@ -298,7 +402,7 @@ mod tests {
         let feed = VecFeed::new(sample_ticks(50));
         let mut pipe = Pipeline::new(
             feed,
-            SpscRingBuffer::<Tick, 1024>::new(),
+            SpscRingBuffer::<MarketTick, 1024>::new(),
             L3MapBook::new(),
             MarketMakerStrategy::new(1, 200, 0, 10),
             PassThroughRisk,
@@ -306,5 +410,6 @@ mod tests {
         );
         let stats = pipe.run();
         assert_eq!(stats.ticks, 50);
+        assert_eq!(stats.illegal_transitions, 0);
     }
 }

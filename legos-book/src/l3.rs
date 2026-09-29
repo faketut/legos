@@ -3,7 +3,7 @@
 //! 维护两套结构：
 //!
 //! * `orders: BTreeMap<u64, Order>` — 订单 ID → 订单明细（精确的排队位置分析）；
-//! * `bid_qty / ask_qty: BTreeMap<i64, u64>` — 价格 → 该档总挂单量（快速取最优）。
+//! * `bid_qty / ask_qty: BTreeMap<i64, u32>` — 价格 → 该档总挂单量（快速取最优）。
 //!
 //! 事件语义：
 //!
@@ -18,13 +18,13 @@
 
 use std::collections::BTreeMap;
 
-use legos_core::{EventKind, Order, OrderBook, Side, Tick};
+use legos_core::{EventKind, MarketTick, Order, OrderBook, Side};
 
 #[derive(Debug, Default)]
 pub struct L3MapBook {
     orders: BTreeMap<u64, Order>,
-    bid_qty: BTreeMap<i64, u64>,
-    ask_qty: BTreeMap<i64, u64>,
+    bid_qty: BTreeMap<i64, u32>,
+    ask_qty: BTreeMap<i64, u32>,
 }
 
 impl L3MapBook {
@@ -37,7 +37,7 @@ impl L3MapBook {
         self.orders.len()
     }
 
-    fn level_mut(&mut self, side: Side) -> &mut BTreeMap<i64, u64> {
+    fn level_mut(&mut self, side: Side) -> &mut BTreeMap<i64, u32> {
         match side {
             Side::Bid => &mut self.bid_qty,
             Side::Ask => &mut self.ask_qty,
@@ -51,12 +51,12 @@ impl L3MapBook {
         if new <= 0 {
             map.remove(&price);
         } else {
-            *entry = new as u64;
+            *entry = new as u32;
         }
     }
 
     /// 从最优档开始扣减 `qty`（成交场景），跨档继续。
-    fn take_liquidity(&mut self, side: Side, mut qty: u64) {
+    fn take_liquidity(&mut self, side: Side, mut qty: u32) {
         while qty > 0 {
             let best = match side {
                 Side::Bid => self.bid_qty.iter().next_back().map(|(&p, &q)| (p, q)),
@@ -74,21 +74,21 @@ impl L3MapBook {
 }
 
 impl OrderBook for L3MapBook {
-    fn apply(&mut self, ev: &Tick) {
-        match ev.kind {
+    fn apply(&mut self, ev: &MarketTick) {
+        match ev.kind() {
             EventKind::Add => {
                 let order = Order::from(ev);
-                self.orders.insert(ev.order_id, order);
-                self.add_level_qty(ev.side, ev.price, ev.qty as i64);
+                self.orders.insert(ev.order_id as u64, order);
+                self.add_level_qty(ev.side(), ev.price, ev.qty as i64);
             }
             EventKind::Cancel => {
-                if let Some(order) = self.orders.remove(&ev.order_id) {
+                if let Some(order) = self.orders.remove(&(ev.order_id as u64)) {
                     self.add_level_qty(order.side, order.price, -(order.qty as i64));
                 }
             }
             EventKind::Trade => {
                 // 成交方向：买方主动吃卖盘 / 卖方主动吃买盘。
-                let resting = match ev.side {
+                let resting = match ev.side() {
                     Side::Bid => Side::Ask,
                     Side::Ask => Side::Bid,
                 };
@@ -97,11 +97,11 @@ impl OrderBook for L3MapBook {
         }
     }
 
-    fn best_bid(&self) -> Option<(i64, u64)> {
+    fn best_bid(&self) -> Option<(i64, u32)> {
         self.bid_qty.iter().next_back().map(|(&p, &q)| (p, q))
     }
 
-    fn best_ask(&self) -> Option<(i64, u64)> {
+    fn best_ask(&self) -> Option<(i64, u32)> {
         self.ask_qty.iter().next().map(|(&p, &q)| (p, q))
     }
 }
@@ -110,16 +110,8 @@ impl OrderBook for L3MapBook {
 mod tests {
     use super::*;
 
-    fn add(order_id: u64, side: Side, price: i64, qty: u64) -> Tick {
-        Tick {
-            symbol_id: 1,
-            price,
-            qty,
-            side,
-            kind: EventKind::Add,
-            order_id,
-            ts_ns: 0,
-        }
+    fn add(order_id: u32, side: Side, price: i64, qty: u32) -> MarketTick {
+        MarketTick::new(1, price, qty, side, EventKind::Add, order_id, 0)
     }
 
     #[test]
@@ -133,20 +125,14 @@ mod tests {
         assert_eq!(b.order_count(), 3);
 
         // 按订单 ID 撤销其中一笔：同价档总量应精确扣减。
-        b.apply(&Tick {
-            kind: EventKind::Cancel,
-            order_id: 1,
-            ..add(0, Side::Bid, 0, 0)
-        });
+        let cancel = MarketTick::new(1, 0, 0, Side::Bid, EventKind::Cancel, 1, 0);
+        b.apply(&cancel);
         assert_eq!(b.best_bid(), Some((99_0000, 50)));
         assert_eq!(b.order_count(), 2);
 
         // 撤销不存在的订单 ID：静默忽略。
-        b.apply(&Tick {
-            kind: EventKind::Cancel,
-            order_id: 999,
-            ..add(0, Side::Bid, 0, 0)
-        });
+        let cancel_missing = MarketTick::new(1, 0, 0, Side::Bid, EventKind::Cancel, 999, 0);
+        b.apply(&cancel_missing);
         assert_eq!(b.best_bid(), Some((99_0000, 50)));
     }
 
@@ -156,12 +142,8 @@ mod tests {
         b.apply(&add(1, Side::Ask, 100_0000, 30));
         b.apply(&add(2, Side::Ask, 100_5000, 50));
         // 买方主动成交 60：吃掉 100_0000 整档 + 100_5000 的 30。
-        b.apply(&Tick {
-            kind: EventKind::Trade,
-            side: Side::Bid,
-            qty: 60,
-            ..add(0, Side::Bid, 0, 0)
-        });
+        let trade = MarketTick::new(1, 100_2500, 60, Side::Bid, EventKind::Trade, 9, 0);
+        b.apply(&trade);
         assert_eq!(b.best_ask(), Some((100_5000, 20)));
     }
 

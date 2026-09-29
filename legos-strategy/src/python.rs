@@ -35,7 +35,7 @@ mod real {
     /// 嵌入 CPython 的策略：每 tick 调用 Python 的 `predict` 函数。
     pub struct PythonBindingStrategy {
         predict: Py<PyAny>,
-        symbol_id: u32,
+        symbol_id: u16,
         next_id: u64,
     }
 
@@ -49,7 +49,7 @@ mod real {
         /// let s = PythonBindingStrategy::load("model.py", "predict", 1).unwrap();
         /// # }
         /// ```
-        pub fn load(path: &str, func: &str, symbol_id: u32) -> PyResult<Self> {
+        pub fn load(path: &str, func: &str, symbol_id: u16) -> PyResult<Self> {
             Python::with_gil(|py| {
                 let code = std::fs::read_to_string(path).map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("读取模型文件失败: {e}"))
@@ -67,10 +67,10 @@ mod real {
 
         fn call_predict(
             &self,
-            bid: Option<(i64, u64)>,
-            ask: Option<(i64, u64)>,
+            bid: Option<(i64, u32)>,
+            ask: Option<(i64, u32)>,
             mid: Option<i64>,
-        ) -> Option<(u8, i64, u64)> {
+        ) -> Option<(u8, i64, u32)> {
             Python::with_gil(|py| {
                 let kwargs = PyDict::new_bound(py);
                 kwargs.set_item("bid", bid.map(|(p, _)| p)).ok()?;
@@ -80,7 +80,7 @@ mod real {
                 if ret.is_none(py) {
                     return None;
                 }
-                let (side, price, qty): (String, i64, u64) = ret.extract(py).ok()?;
+                let (side, price, qty): (String, i64, u32) = ret.extract(py).ok()?;
                 let side = match side.as_str() {
                     "B" => b'B',
                     "S" => b'S',
@@ -94,8 +94,8 @@ mod real {
     impl TradingStrategy for PythonBindingStrategy {
         fn on_tick(
             &mut self,
-            bid: Option<(i64, u64)>,
-            ask: Option<(i64, u64)>,
+            bid: Option<(i64, u32)>,
+            ask: Option<(i64, u32)>,
             mid: Option<i64>,
         ) -> Option<OrderIntent> {
             let (s, price, qty) = self.call_predict(bid, ask, mid)?;
@@ -140,8 +140,8 @@ impl PythonBindingStrategy {
 impl TradingStrategy for PythonBindingStrategy {
     fn on_tick(
         &mut self,
-        _bid: Option<(i64, u64)>,
-        _ask: Option<(i64, u64)>,
+        _bid: Option<(i64, u32)>,
+        _ask: Option<(i64, u32)>,
         _mid: Option<i64>,
     ) -> Option<OrderIntent> {
         // stub：不产生任何交易意图。启用 python feature 后替换为真实实现。

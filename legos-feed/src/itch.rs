@@ -6,18 +6,19 @@
 //! [u16 BE 消息长度][1 字节类型][消息体...] [u16 BE 长度][类型][消息体...] ...
 //! ```
 //!
-//! 所有多字节整数均为大端。`symbol_id` 取消息头的 **Stock Locate**（u16），
-//! 价格取 ITCH 原生单位（1/10000 美元的整数），直接作为系统内的 tick 整数。
+//! 所有多字节整数均为大端。`symbol_id` 取消息头的 **Stock Locate**（u16，
+//! 直接对应 `MarketTick.symbol_id`），价格取 ITCH 原生单位（1/10000 美元
+//! 的整数），直接作为系统内的 tick 整数。
 //!
 //! # 已实现的消息类型
 //!
-//! | 类型 | 名称                 | 长度 | 转为的 `Tick`                     |
-//! |------|----------------------|------|-----------------------------------|
-//! | `'A'`| Add Order          | 36   | `Add`（方向/量/价齐全）            |
-//! | `'E'`| Order Executed     | 31   | `Trade`（方向/价从 `'A'` 的记录补全）|
-//! | `'C'`| Executed with Price| 36   | `Trade`（自带成交价）              |
-//! | `'X'`| Order Cancel       | 23   | `Cancel`（撤销股数）               |
-//! | `'D'`| Order Delete       | 19   | `Cancel`（整单删除）               |
+//! | 类型 | 名称                 | 长度 | 转为的 `MarketTick`                  |
+//! |------|----------------------|------|--------------------------------------|
+//! | `'A'`| Add Order          | 36   | `Add`（方向/量/价齐全）               |
+//! | `'E'`| Order Executed     | 31   | `Trade`（方向/价从 `'A'` 的记录补全） |
+//! | `'C'`| Executed with Price| 36   | `Trade`（自带成交价）                 |
+//! | `'X'`| Order Cancel       | 23   | `Cancel`（撤销股数）                  |
+//! | `'D'`| Order Delete       | 19   | `Cancel`（整单删除）                  |
 //!
 //! # 未实现（跳过）的消息类型
 //!
@@ -29,17 +30,23 @@
 //! 为补全 `'E'`/`'X'`/`'D'` 的方向与价格，解析器内部维护一张
 //! `order_ref -> (Side, price, 剩余股数)` 的小表（由 `'A'` 写入）。
 //! 这张表只在 feed 解析阶段使用，不在纳秒热路径上。
+//!
+//! # 精度说明
+//!
+//! ITCH 的 `order_ref` 为 u64，`MarketTick.order_id` 为 u32——超出 u32 范围
+//! 的订单号会被**截断**（`as u32`，低 32 位）。NASDAQ 实际 order ref 远小于
+//! 2^32，此处为文档化取舍；`open` 内部表仍用完整 u64 做精确匹配。
 
 use std::collections::HashMap;
 
-use legos_core::{EventKind, MarketDataFeed, Side, Tick};
+use legos_core::{EventKind, MarketDataFeed, MarketTick, Side};
 
-/// ITCH 5.0 流式解析器：`push_bytes` 投喂原始字节，`next_event` 逐个吐出 `Tick`。
+/// ITCH 5.0 流式解析器：`push_bytes` 投喂原始字节，`next_event` 逐个吐出 `MarketTick`。
 pub struct NativeItchParser {
     buf: Vec<u8>,
     cursor: usize,
     /// order_ref -> (side, price, 剩余股数)
-    open: HashMap<u64, (Side, i64, u64)>,
+    open: HashMap<u64, (Side, i64, u32)>,
 }
 
 impl NativeItchParser {
@@ -71,7 +78,7 @@ impl NativeItchParser {
     }
 
     /// 尝试解析一条完整消息；半包 / 无数据时返回 `None`。
-    fn try_parse_one(&mut self) -> Option<Tick> {
+    fn try_parse_one(&mut self) -> Option<MarketTick> {
         loop {
             let avail = self.buf.len() - self.cursor;
             if avail < 2 {
@@ -93,8 +100,8 @@ impl NativeItchParser {
 
     fn parse_message(
         msg: &[u8],
-        open: &mut HashMap<u64, (Side, i64, u64)>,
-    ) -> Option<Tick> {
+        open: &mut HashMap<u64, (Side, i64, u32)>,
+    ) -> Option<MarketTick> {
         let typ = *msg.first()?;
         match typ {
             b'A' => parse_add(msg, open),
@@ -114,7 +121,7 @@ impl Default for NativeItchParser {
 }
 
 impl MarketDataFeed for NativeItchParser {
-    fn next_event(&mut self) -> Option<Tick> {
+    fn next_event(&mut self) -> Option<MarketTick> {
         self.try_parse_one()
     }
 }
@@ -149,47 +156,47 @@ fn ts48_at(m: &[u8], off: usize) -> Option<u64> {
     })
 }
 
-fn header(m: &[u8]) -> Option<(u32, u64)> {
+fn header(m: &[u8]) -> Option<(u16, u64)> {
     // 返回 (symbol_id = stock_locate, ts_ns)
-    Some((u16_at(m, 1)? as u32, ts48_at(m, 5)?))
+    Some((u16_at(m, 1)?, ts48_at(m, 5)?))
 }
 
 // --- 各消息类型的解析 -------------------------------------------------------
 
 /// 'A' Add Order（36 字节）。
-fn parse_add(m: &[u8], open: &mut HashMap<u64, (Side, i64, u64)>) -> Option<Tick> {
+fn parse_add(m: &[u8], open: &mut HashMap<u64, (Side, i64, u32)>) -> Option<MarketTick> {
     if m.len() < 36 {
         return None;
     }
     let (symbol_id, ts_ns) = header(m)?;
     let order_ref = u64_at(m, 11)?;
     let side = Side::from_byte(m[19])?;
-    let shares = u32_at(m, 20)? as u64;
+    let shares = u32_at(m, 20)?;
     let price = u32_at(m, 32)? as i64;
     open.insert(order_ref, (side, price, shares));
-    Some(Tick {
+    Some(MarketTick::new(
         symbol_id,
         price,
-        qty: shares,
+        shares,
         side,
-        kind: EventKind::Add,
-        order_id: order_ref,
+        EventKind::Add,
+        order_ref as u32, // 精度说明见模块文档
         ts_ns,
-    })
+    ))
 }
 
 /// 'E' Order Executed（31 字节）：方向/价格从 'A' 的记录补全。
 fn parse_executed(
     m: &[u8],
-    open: &mut HashMap<u64, (Side, i64, u64)>,
+    open: &mut HashMap<u64, (Side, i64, u32)>,
     price_override: Option<i64>,
-) -> Option<Tick> {
+) -> Option<MarketTick> {
     if m.len() < 31 {
         return None;
     }
     let (symbol_id, ts_ns) = header(m)?;
     let order_ref = u64_at(m, 11)?;
-    let exec_qty = u32_at(m, 19)? as u64;
+    let exec_qty = u32_at(m, 19)?;
     let (side, price, remaining) = *open.get(&order_ref)?;
     let price = price_override.unwrap_or(price);
     let left = remaining.saturating_sub(exec_qty);
@@ -198,23 +205,23 @@ fn parse_executed(
     } else {
         open.insert(order_ref, (side, price, left));
     }
-    // 成交方向：Tick.side 记录的是**被吃掉的挂单**方向（账簿据此扣减对应档位）。
-    Some(Tick {
+    // 成交方向：tick.side 记录的是**被吃掉的挂单**方向（账簿据此扣减对应档位）。
+    Some(MarketTick::new(
         symbol_id,
         price,
-        qty: exec_qty,
+        exec_qty,
         side,
-        kind: EventKind::Trade,
-        order_id: order_ref,
+        EventKind::Trade,
+        order_ref as u32,
         ts_ns,
-    })
+    ))
 }
 
 /// 'C' Order Executed with Price（36 字节）：自带成交价。
 fn parse_executed_with_price(
     m: &[u8],
-    open: &mut HashMap<u64, (Side, i64, u64)>,
-) -> Option<Tick> {
+    open: &mut HashMap<u64, (Side, i64, u32)>,
+) -> Option<MarketTick> {
     if m.len() < 36 {
         return None;
     }
@@ -223,13 +230,13 @@ fn parse_executed_with_price(
 }
 
 /// 'X' Order Cancel（23 字节）。
-fn parse_cancel(m: &[u8], open: &mut HashMap<u64, (Side, i64, u64)>) -> Option<Tick> {
+fn parse_cancel(m: &[u8], open: &mut HashMap<u64, (Side, i64, u32)>) -> Option<MarketTick> {
     if m.len() < 23 {
         return None;
     }
     let (symbol_id, ts_ns) = header(m)?;
     let order_ref = u64_at(m, 11)?;
-    let cancelled = u32_at(m, 19)? as u64;
+    let cancelled = u32_at(m, 19)?;
     let (side, price, remaining) = *open.get(&order_ref)?;
     let left = remaining.saturating_sub(cancelled);
     if left == 0 {
@@ -237,34 +244,34 @@ fn parse_cancel(m: &[u8], open: &mut HashMap<u64, (Side, i64, u64)>) -> Option<T
     } else {
         open.insert(order_ref, (side, price, left));
     }
-    Some(Tick {
+    Some(MarketTick::new(
         symbol_id,
         price,
-        qty: cancelled,
+        cancelled,
         side,
-        kind: EventKind::Cancel,
-        order_id: order_ref,
+        EventKind::Cancel,
+        order_ref as u32,
         ts_ns,
-    })
+    ))
 }
 
 /// 'D' Order Delete（19 字节）：整单删除。
-fn parse_delete(m: &[u8], open: &mut HashMap<u64, (Side, i64, u64)>) -> Option<Tick> {
+fn parse_delete(m: &[u8], open: &mut HashMap<u64, (Side, i64, u32)>) -> Option<MarketTick> {
     if m.len() < 19 {
         return None;
     }
     let (symbol_id, ts_ns) = header(m)?;
     let order_ref = u64_at(m, 11)?;
     let (side, price, remaining) = open.remove(&order_ref)?;
-    Some(Tick {
+    Some(MarketTick::new(
         symbol_id,
         price,
-        qty: remaining,
+        remaining,
         side,
-        kind: EventKind::Cancel,
-        order_id: order_ref,
+        EventKind::Cancel,
+        order_ref as u32,
         ts_ns,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -296,9 +303,9 @@ mod tests {
         let mut p = NativeItchParser::new();
         p.push_bytes(&add_msg(42, 12345, b'B', 300, 1_502_500));
         let t = p.next_event().expect("应解析出一条 Add");
-        assert_eq!(t.kind, EventKind::Add);
+        assert_eq!(t.kind(), EventKind::Add);
         assert_eq!(t.symbol_id, 42, "symbol_id 取 stock-locate");
-        assert_eq!(t.side, Side::Bid);
+        assert_eq!(t.side(), Side::Bid);
         assert_eq!(t.qty, 300);
         assert_eq!(t.price, 1_502_500, "ITCH 价格单位 1/10000 美元直接作为 tick");
         assert_eq!(t.order_id, 12345);
@@ -343,16 +350,16 @@ mod tests {
         p.push_bytes(&frame(d));
 
         let a = p.next_event().unwrap();
-        assert_eq!(a.kind, EventKind::Add);
+        assert_eq!(a.kind(), EventKind::Add);
         let t = p.next_event().unwrap();
-        assert_eq!(t.kind, EventKind::Trade);
+        assert_eq!(t.kind(), EventKind::Trade);
         assert_eq!(t.qty, 200);
-        assert_eq!(t.side, Side::Ask, "被吃掉的是卖单");
+        assert_eq!(t.side(), Side::Ask, "被吃掉的是卖单");
         assert_eq!(t.price, 2_000_000, "价格从 Add 记录补全");
         let c = p.next_event().unwrap();
-        assert_eq!((c.kind, c.qty), (EventKind::Cancel, 100));
+        assert_eq!((c.kind(), c.qty), (EventKind::Cancel, 100));
         let del = p.next_event().unwrap();
-        assert_eq!((del.kind, del.qty), (EventKind::Cancel, 200), "剩余 500-200-100=200");
+        assert_eq!((del.kind(), del.qty), (EventKind::Cancel, 200), "剩余 500-200-100=200");
         assert_eq!(p.open_orders(), 0);
         assert_eq!(p.next_event(), None);
     }
@@ -393,6 +400,6 @@ mod tests {
     fn sell_side_indicator_maps_to_ask() {
         let mut p = NativeItchParser::new();
         p.push_bytes(&add_msg(3, 1, b'S', 1, 5));
-        assert_eq!(p.next_event().unwrap().side, Side::Ask);
+        assert_eq!(p.next_event().unwrap().side(), Side::Ask);
     }
 }

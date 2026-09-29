@@ -15,14 +15,14 @@ use legos_core::{OrderIntent, Side, TradingStrategy};
 pub struct MarketMakerStrategy {
     spread_ticks: i64,
     skew_ticks: i64,
-    order_qty: u64,
-    symbol_id: u32,
+    order_qty: u32,
+    symbol_id: u16,
     next_id: u64,
     quote_bid_next: bool,
 }
 
 impl MarketMakerStrategy {
-    pub fn new(symbol_id: u32, spread_ticks: i64, skew_ticks: i64, order_qty: u64) -> Self {
+    pub fn new(symbol_id: u16, spread_ticks: i64, skew_ticks: i64, order_qty: u32) -> Self {
         Self {
             spread_ticks,
             skew_ticks,
@@ -37,8 +37,8 @@ impl MarketMakerStrategy {
 impl TradingStrategy for MarketMakerStrategy {
     fn on_tick(
         &mut self,
-        _bid: Option<(i64, u64)>,
-        _ask: Option<(i64, u64)>,
+        _bid: Option<(i64, u32)>,
+        _ask: Option<(i64, u32)>,
         mid: Option<i64>,
     ) -> Option<OrderIntent> {
         let mid = mid?;
