@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "pipeline_bench"
 harness = false
 
+[[bench]]
+name = "order_path_bench"
+harness = false
+
 [dependencies]
 legos-core = { path = "../legos-core" }
 legos-bus = { path = "../legos-bus" }
@@ -24,3 +28,7 @@ core_affinity = "0.8"
 
 [dev-dependencies]
 criterion = "0.5"
+
+[[bench]]
+name = "l2_ab_bench"
+harness = false

@@ -13,7 +13,10 @@
 use legos_core::{OrderIntent, Side, TradingStrategy};
 
 pub struct MarketMakerStrategy {
-    spread_ticks: i64,
+    /// `spread_ticks / 2` 预计算：`on_tick` 热路径省一次 i64 除法
+    /// （拆分基准 `strategy_on_tick_mm` 证明除法是该函数主导成本；
+    /// `spread_ticks` 构造后不可变，预计算与逐 tick 相除语义完全一致）。
+    half_spread_ticks: i64,
     skew_ticks: i64,
     order_qty: u32,
     symbol_id: u16,
@@ -24,7 +27,7 @@ pub struct MarketMakerStrategy {
 impl MarketMakerStrategy {
     pub fn new(symbol_id: u16, spread_ticks: i64, skew_ticks: i64, order_qty: u32) -> Self {
         Self {
-            spread_ticks,
+            half_spread_ticks: spread_ticks / 2,
             skew_ticks,
             order_qty,
             symbol_id,
@@ -42,11 +45,10 @@ impl TradingStrategy for MarketMakerStrategy {
         mid: Option<i64>,
     ) -> Option<OrderIntent> {
         let mid = mid?;
-        let half = self.spread_ticks / 2;
         let (side, price) = if self.quote_bid_next {
-            (Side::Bid, mid - half + self.skew_ticks)
+            (Side::Bid, mid - self.half_spread_ticks + self.skew_ticks)
         } else {
-            (Side::Ask, mid + half + self.skew_ticks)
+            (Side::Ask, mid + self.half_spread_ticks + self.skew_ticks)
         };
         self.quote_bid_next = !self.quote_bid_next;
         self.next_id += 1;

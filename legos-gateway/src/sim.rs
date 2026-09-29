@@ -21,7 +21,6 @@ struct SimQuote {
     bid_qty: u32,
     ask: i64,
     ask_qty: u32,
-    valid: bool,
 }
 
 const MAX_SYMBOLS: usize = 64;
@@ -46,41 +45,43 @@ impl SimulatedExchange {
     }
 
     /// 灌入某品种最新最优买卖报价（通常由账簿的 best_bid/best_ask 驱动）。
+    ///
+    /// 单次线性扫描：命中已有品种就地更新；同时记住首个空槽位，
+    /// 未命中时填入；槽位用尽静默忽略（回测品种数远小于 64）。
+    /// 与原来的"先找已有、再找空槽"双扫描可观察语义完全一致。
     pub fn update_quote(&mut self, symbol_id: u16, bid: (i64, u32), ask: (i64, u32)) {
         let q = SimQuote {
             bid: bid.0,
             bid_qty: bid.1,
             ask: ask.0,
             ask_qty: ask.1,
-            valid: true,
         };
-        if let Some(slot) = self.quotes.iter_mut().find(|s| s.map(|(id, _)| id) == Some(symbol_id))
-        {
-            *slot = Some((symbol_id, q));
-            return;
+        let mut empty = None;
+        for (i, s) in self.quotes.iter_mut().enumerate() {
+            match s {
+                Some((id, _)) if *id == symbol_id => {
+                    *s = Some((symbol_id, q));
+                    return;
+                }
+                None if empty.is_none() => empty = Some(i),
+                _ => {}
+            }
         }
-        if let Some(slot) = self.quotes.iter_mut().find(|s| s.is_none()) {
-            *slot = Some((symbol_id, q));
+        if let Some(i) = empty {
+            self.quotes[i] = Some((symbol_id, q));
         }
-        // 槽位用尽：静默忽略（回测品种数远小于 64）。
     }
 
-    fn quote(&self, symbol_id: u16) -> Option<SimQuote> {
+    /// 报价槽位线性查找（热路径）：单次扫描返回槽位下标，零堆分配。
+    ///
+    /// `send_order` 原来先 `quote()` 扫描一次读盘口、成交扣减时再
+    /// `quote_mut()` 扫描一次；合并为一次 `slot()` 扫描后直接下标访问，
+    /// 成交路径省一次 64 槽位扫描（拆分基准 `gateway_send_order_fill`
+    /// 证明查表是该函数主导成本）。
+    fn slot(&self, symbol_id: u16) -> Option<usize> {
         self.quotes
             .iter()
-            .flatten()
-            .find(|(id, _)| *id == symbol_id)
-            .map(|(_, q)| *q)
-            .filter(|q| q.valid)
-    }
-
-    fn quote_mut(&mut self, symbol_id: u16) -> Option<&mut SimQuote> {
-        self.quotes
-            .iter_mut()
-            .flatten()
-            .find(|(id, _)| *id == symbol_id)
-            .map(|(_, q)| q)
-            .filter(|q| q.valid)
+            .position(|s| matches!(s, Some((id, _)) if *id == symbol_id))
     }
 }
 
@@ -92,12 +93,20 @@ impl ExecutionGateway for SimulatedExchange {
     }
 
     fn send_order(&mut self, order: &OrderIntent) -> OrderAck {
-        let quote = match self.quote(order.symbol_id) {
-            Some(q) => q,
+        // 单次槽位扫描拿到下标，后续读盘口/扣减都直接下标访问，
+        // 不再做第二次线性查找。
+        let idx = match self.slot(order.symbol_id) {
+            Some(i) => i,
             None => {
                 self.rejected += 1;
                 return OrderAck::rejected(order.client_order_id);
             }
+        };
+        // `slot()` 返回 Some 即保证该槽位为 `Some`；用 let-else 而非
+        // unwrap，永不 panic（§1.1 契约）。
+        let Some((_, quote)) = self.quotes[idx] else {
+            self.rejected += 1;
+            return OrderAck::rejected(order.client_order_id);
         };
         if order.qty == 0 {
             self.rejected += 1;
@@ -129,8 +138,8 @@ impl ExecutionGateway for SimulatedExchange {
             Side::Bid => touch_price + self.slippage_ticks,
             Side::Ask => touch_price - self.slippage_ticks,
         };
-        // 扣减对手盘剩余量。
-        if let Some(q) = self.quote_mut(order.symbol_id) {
+        // 扣减对手盘剩余量：直接下标写回（`slot()` 已定位，无需二次扫描）。
+        if let Some((_, q)) = self.quotes[idx].as_mut() {
             match order.side {
                 Side::Bid => q.ask_qty -= fill_qty,
                 Side::Ask => q.bid_qty -= fill_qty,

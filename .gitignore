@@ -17,3 +17,6 @@ target/criterion/
 
 # scripts/fetch_ticks.py 抓的行情数据（本地生成，不进仓库）
 /data/
+
+# P2 busy-poll 原型编译产物（用 prototypes/net/run.sh 重新生成）
+prototypes/net/udp_bench

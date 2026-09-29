@@ -1,0 +1,15 @@
+### 2026-09-29T19:50:45Z host=htch-runtime kernel=7.0.0-38-generic nproc=2
+=== plain (blocking recvfrom, stock kernel path) ===
+mode=plain port=41001 packets=1000000 (+200000 warmup) pace=20000 pps
+[rx] bound, busypoll=false pinned_cpu1=true
+[tx] pinned_cpu0=true starting paced send
+[tx] done, sent 1200000 packets
+received_measured=1000000 drops=0
+latency_ns: min=2153 p50=9234 p90=30916 p99=1491317 p999=13114181 max=39702013 mean=91411.6
+=== busypoll (SO_BUSY_POLL=50us + non-blocking spin) ===
+mode=busypoll port=41002 packets=1000000 (+200000 warmup) pace=20000 pps
+[rx] bound, busypoll=true pinned_cpu1=true
+[tx] pinned_cpu0=true starting paced send
+[tx] done, sent 1200000 packets
+received_measured=1000000 drops=0
+latency_ns: min=2083 p50=4166 p90=840540 p99=18078207 p999=26059078 max=31127030 mean=582423.9

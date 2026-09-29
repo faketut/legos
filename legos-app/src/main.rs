@@ -421,6 +421,68 @@ mod tests {
     }
 
     #[test]
+    fn backpressure_stress_producer_faster_than_consumer() {
+        // 背压满载压测（P4）：生产速度 > 消费速度持续一段时间。
+        //
+        // 场景：feed 一次性给出 200_000 个 tick，bus 容量仅 16。
+        // 每轮 `pump_once` 的 feed→bus 内循环都会把 bus 灌满（push 失败），
+        // 当前事件暂存进 `pending` 槽，下轮优先入总线——`pending` 被反复使用。
+        // 断言：零丢失（ticks == feed 总数）、结束时 pending 为空；
+        // 测量：drain 总耗时、单轮最大停顿（max round stall）、吞吐。
+        const N: usize = 200_000;
+        let feed = VecFeed::new(sample_ticks(N));
+        let mut pipe = Pipeline::new(
+            feed,
+            SpscRingBuffer::<MarketTick, 16>::new(),
+            L2FlatArrayBook::<10>::new(),
+            MarketMakerStrategy::new(1, 200, 0, 10),
+            PassThroughRisk,
+            SimulatedExchange::new(1),
+        );
+        let mut stats = PipelineStats::default();
+        let mut rounds: u64 = 0;
+        let mut pending_rounds: u64 = 0;
+        let mut max_round_ns: u64 = 0;
+        let t0 = std::time::Instant::now();
+        // 与 `run()` 相同的 3 轮无进展退出语义。
+        let mut idle_rounds = 0u32;
+        loop {
+            let r0 = std::time::Instant::now();
+            let progress = pipe.pump_once(&mut stats);
+            let dt = r0.elapsed().as_nanos() as u64;
+            if dt > max_round_ns {
+                max_round_ns = dt;
+            }
+            rounds += 1;
+            if pipe.pending.is_some() {
+                pending_rounds += 1;
+            }
+            if progress {
+                idle_rounds = 0;
+            } else {
+                idle_rounds += 1;
+                if idle_rounds >= 3 {
+                    break;
+                }
+            }
+        }
+        let total = t0.elapsed();
+        assert!(
+            pending_rounds > 0,
+            "背压必须真实发生：pending 槽应被实际使用"
+        );
+        assert_eq!(stats.ticks, N as u64, "bus 背压下永不丢 tick");
+        assert!(pipe.pending.is_none(), "结束时暂存槽必须为空");
+        assert_eq!(stats.illegal_transitions, 0);
+        eprintln!(
+            "[backpressure] N={N} rounds={rounds} pending_rounds={pending_rounds} \
+             drain_total={total:?} max_round_stall={max_round_ns}ns \
+             throughput={:.0} ticks/s",
+            N as f64 / total.as_secs_f64(),
+        );
+    }
+
+    #[test]
     fn pipeline_with_hard_risk_blocks_oversize() {
         // 风控上限设得很低：大名义金额意图应被拦截。
         let feed = VecFeed::new(sample_ticks(50));
