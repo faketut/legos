@@ -34,11 +34,16 @@ feed.next_event() → bus.push() → bus.pop() → book.apply()
   `Accepted` 为该 tick 的观察终点（实盘中后续由成交回报继续推进，
   见 `legos-core/SPEC.md` §2.2）。
 
-### 1.2 run() 终止规则
+### 1.2 run() 终止规则与背压不变量
 
-- `pump_once`：先把 feed 泵入 bus（bus 满则停，避免覆盖），
-  再把 bus 排空走完链路；返回本轮是否有进展；
-- `run()`：连续 **3 轮无进展**（feed 耗尽且 bus 排空）后返回 `PipelineStats`；
+- `pump_once`：先把上轮暂存的 `pending` 事件送入 bus，再把 feed 泵入 bus，
+  最后把 bus 排空走完链路；返回本轮是否有进展；
+- **背压不变量**：bus 满时，从 feed 取出的事件暂存于 `pending`
+  （`Option<MarketTick>`），**永不静默丢弃**；`run()` 返回时 `pending`
+  必须为 `None`（单测 `no_tick_loss_when_bus_fills` 锁定：容量 8 的 bus
+  走完 5000 个 tick，`stats.ticks == 5000`）；
+- `run()`：连续 **3 轮无进展**（feed 耗尽、bus 排空、`pending` 为空）后
+  返回 `PipelineStats`；
 - `run_forever()`：永不返回；feed 的 `None` 只视为暂时无数据（实盘常驻）。
 
 ### 1.3 CPU 亲和性
@@ -53,6 +58,10 @@ feed.next_event() → bus.push() → bus.pop() → book.apply()
 `L2FlatArrayBook<10> + PassThroughRisk + SimulatedExchange` 换成
 `L3MapBook + HardLimitRisk + FixProtocolGateway`；
 函数不被调用但必须通过编译——证明换积木零逻辑改动。
+
+实盘积木替换见 `legos-testnet` 的 `src/bin/paper_trade.rs`：
+`TestnetWsFeed → L2FlatArrayBook → MarketMakerStrategy → HardLimitRisk → TestnetRestGateway`
+（0 成本 paper-trading，见 README「0 成本实盘验证」）。
 
 ### 1.5 PipelineStats 字段
 

@@ -43,6 +43,9 @@ pub struct Pipeline<F, B, Bk, S, R, G> {
     pub strategy: S,
     pub risk: R,
     pub gateway: G,
+    /// bus 满时暂存的事件。不变量：`run()` 返回时必须为 `None`——
+    /// feed 取出的事件绝不允许静默丢弃（bus 满只是背压，不是丢弃理由）。
+    pending: Option<MarketTick>,
 }
 
 /// 单次运行统计。
@@ -75,6 +78,7 @@ where
             strategy,
             risk,
             gateway,
+            pending: None,
         }
     }
 
@@ -135,19 +139,33 @@ where
     }
 
     /// 把 feed 泵入总线、再把总线排空走完链路；返回本轮是否有进展。
+    ///
+    /// 背压不变量：从 feed 取出的事件要么进入 bus，要么暂存在 `pending`
+    /// 等待下轮，**永不静默丢弃**。
     fn pump_once(&mut self, stats: &mut PipelineStats) -> bool {
         let mut progress = false;
-        // 1) feed → bus（bus 满则停下先去 drain，避免覆盖）。
-        loop {
-            match self.feed.next_event() {
-                Some(ev) => {
-                    if self.bus.push(ev) {
-                        progress = true;
-                    } else {
-                        break;
+        // 0) 上轮暂存的事件优先入总线。
+        if let Some(ev) = self.pending.take() {
+            if self.bus.push(ev) {
+                progress = true;
+            } else {
+                self.pending = Some(ev);
+            }
+        }
+        // 1) feed → bus（bus 满则把当前事件暂存，绝不丢弃）。
+        if self.pending.is_none() {
+            loop {
+                match self.feed.next_event() {
+                    Some(ev) => {
+                        if self.bus.push(ev) {
+                            progress = true;
+                        } else {
+                            self.pending = Some(ev);
+                            break;
+                        }
                     }
+                    None => break,
                 }
-                None => break,
             }
         }
         // 2) bus → book → strategy → risk → gateway。
@@ -216,7 +234,12 @@ fn main() {
 
     // ---- 回测装配：CsvFileFeed + SpscRingBuffer + L2FlatArrayBook<10>
     // ----            + MarketMakerStrategy + PassThroughRisk + SimulatedExchange
-    let feed = CsvFileFeed::open(SAMPLE_CSV).expect("示例 CSV 缺失");
+    // 第一个 CLI 参数可覆盖 CSV 路径（0 成本验证：python3 scripts/fetch_ticks.py 抓的真实数据）。
+    let csv_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| SAMPLE_CSV.to_string());
+    eprintln!("[legos-app] 回测数据源: {csv_path}");
+    let feed = CsvFileFeed::open(&csv_path).expect("CSV 缺失");
     let bus = SpscRingBuffer::<MarketTick, 4096>::new();
     let book = L2FlatArrayBook::<10>::new();
     let strategy = MarketMakerStrategy::new(1, 200, 0, 100);
@@ -375,6 +398,25 @@ mod tests {
         assert_eq!(stats.rejected_by_risk, stats.intents);
         assert_eq!(stats.sent, 0, "被风控拦截的订单不得送网关");
         assert_eq!(pipe.gateway.fills, 0);
+        assert_eq!(stats.illegal_transitions, 0);
+    }
+
+    #[test]
+    fn no_tick_loss_when_bus_fills() {
+        // bus 容量 8、feed 5000 个 tick：旧实现在 bus 满时静默丢弃事件。
+        // 背压不变量：run() 结束时 pending 为空，且 ticks == feed 总数。
+        let feed = VecFeed::new(sample_ticks(5000));
+        let mut pipe = Pipeline::new(
+            feed,
+            SpscRingBuffer::<MarketTick, 8>::new(),
+            L2FlatArrayBook::<10>::new(),
+            MarketMakerStrategy::new(1, 200, 0, 10),
+            PassThroughRisk,
+            SimulatedExchange::new(1),
+        );
+        let stats = pipe.run();
+        assert_eq!(stats.ticks, 5000, "bus 背压下也不得丢 tick");
+        assert!(pipe.pending.is_none(), "结束时暂存槽必须为空");
         assert_eq!(stats.illegal_transitions, 0);
     }
 

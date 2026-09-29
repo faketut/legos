@@ -49,8 +49,11 @@ legos/
 │                   #          SimulatedExchange（内存撮合 + 滑点模型，64 槽位零堆分配报价表）
 ├── legos-strategy  # Phase 4：MarketMakerStrategy / ArbitrageStrategy /
 │                   #          PythonBindingStrategy（默认 stub；python feature 切真实嵌入）
-└── legos-app       # Phase 4：Pipeline<F, B, Bk, S, R, G> 泛型主循环 + core_affinity 绑核
-                    #          + benches/pipeline_bench.rs（criterion 全链路基准）
+├── legos-app       # Phase 4：Pipeline<F, B, Bk, S, R, G> 泛型主循环 + core_affinity 绑核
+│                   #          + benches/pipeline_bench.rs（criterion 全链路基准）
+└── legos-testnet   # 0 成本实盘验证：TestnetWsFeed（Binance Testnet 免费 WS 行情）
+                    #          TestnetRestGateway（Testnet 免费 REST 下单，虚拟资金）
+                    #          + src/bin/paper_trade.rs（paper-trading 压力测试）
 ```
 
 ## 如何替换积木块
@@ -75,15 +78,80 @@ let mut pipe: Pipeline<
 | 本地回测 | `CsvFileFeed` | `SpscRingBuffer` | `L2FlatArrayBook<10>` | `MarketMakerStrategy` | `PassThroughRisk` | `SimulatedExchange` |
 | 实盘交易 | `NativeItchParser` | `SharedMemoryBus` | `L2FlatArrayBook<10>` | `MarketMakerStrategy` | `HardLimitRisk` | `FixProtocolGateway` |
 | 深度研究 | `CsvFileFeed` | `SpscRingBuffer` | `L3MapBook` | `PythonBindingStrategy` | `PassThroughRisk` | `SimulatedExchange` |
+| 模拟盘压力测试 | `TestnetWsFeed` | （直连账簿） | `L2FlatArrayBook<10>` | `MarketMakerStrategy` | `HardLimitRisk` | `TestnetRestGateway` |
+
+## 0 成本实盘验证
+
+全程免费：公开行情不要 key，testnet 下单用虚拟资金。分两步：
+
+### 第 1 步：抓真实 Tick 数据做回测
+
+```bash
+# 抓一天的 BTCUSDT 公开成交数据（data.binance.vision 日度 zip，免费、无需 key）
+python3 scripts/fetch_ticks.py --symbol BTCUSDT --date 2026-09-27 --out data/btcusdt.csv
+# 输出末尾有一行校验：OK rows=478532 cols=symbol_id,side,price,qty,kind,ts_ns ts_range=[...]
+
+# 用抓到的数据跑回测（第一个 CLI 参数覆盖默认示例 CSV）
+cargo run -p legos-app -- data/btcusdt.csv
+```
+
+输出格式与 `CsvFileFeed` 的解析 schema **严格一致**
+（`symbol_id,side,price,qty,kind,ts_ns`，见 `legos-feed/SPEC.md`），
+价格/数量刻度（1e-8）与 `TestnetWsFeed` 完全对齐（对齐单测覆盖）。
+
+> 说明：公开成交数据只有 `TRADE` 事件、没有挂单事件，账簿形不成买卖盘口，
+> 所以做市策略的 `intents` 为 0——这是**预期行为**，不是 bug。
+> 这一步验证的是**吞吐链路**：47.8 万个 tick 零丢失走完
+> feed → 总线 → 账簿 → 策略 → 风控 → 网关（含背压不变量回归测试）。
+> 策略行为验证请用 `legos-feed/data/sample_ticks.csv`（含 ADD 事件）。
+
+也可用 OKX 公开接口抓近期数据（同样免费、无需 key）：
+
+```bash
+python3 scripts/fetch_ticks.py --source okx --symbol BTCUSDT --max-trades 10000 --out data/btcusdt_okx.csv
+```
+
+### 第 2 步：Testnet 模拟盘压力测试
+
+把泛型参数换成实盘积木（`legos-testnet/src/bin/paper_trade.rs` 已装配好）：
+
+```rust
+TestnetWsFeed          // ← CsvFileFeed：Binance Testnet 免费 WS 行情，无需 key
+    → L2FlatArrayBook  // 账簿不变
+    → MarketMakerStrategy
+    → HardLimitRisk
+    → TestnetRestGateway // ← SimulatedExchange：Testnet REST 下单，虚拟资金
+```
+
+```bash
+# 1. 免费申请 testnet key（虚拟资金，0 成本）：
+#    打开 https://testnet.binance.vision → 登录 → API Management → Create API（HMAC）
+export BINANCE_TESTNET_API_KEY=...
+export BINANCE_TESTNET_API_SECRET=...
+
+# 2. 跑模拟盘（默认 BTCUSDT，500 个 tick 后退出并打印统计）
+cargo run -p legos-testnet --bin paper_trade -- BTCUSDT 500
+```
+
+安全说明：
+
+- **行情流不需要 key**，匿名即可订阅；
+- 下单 key **只从环境变量读取**，代码里没有任何硬编码密钥
+  （缺失时直接报错并提示申请步骤，不会静默失败）；
+- 下的是 **testnet 真实订单**（虚拟资金），不是 dry-run，
+  但每单后 sleep 300ms 做限流保护，Ctrl-C 可随时中断；
+- 如所在地区打不开 `testnet.binance.vision`（如返回 451），
+  `TestnetWsFeed::binance_mainnet` 可换用主网公开行情流做只读验证。
 
 ## 构建 / 测试 / 运行
 
 需要 Rust 1.70+（本仓库用 rustup 安装，见环境备注）：
 
 ```bash
-cargo build --workspace        # 构建全部 8 个 crate
-cargo test --workspace         # 运行全部单测（53 个，含多线程 SPSC 压力测试）
+cargo build --workspace        # 构建全部 9 个 crate
+cargo test --workspace         # 运行全部单测（77 个，含多线程 SPSC 压力测试）
 cargo run -p legos-app         # 回测：CSV → 总线 → 账簿 → 做市策略 → 风控 → 模拟撮合
+cargo run -p legos-app -- data/btcusdt.csv   # 用 scripts/fetch_ticks.py 抓的真实数据回测
 cargo bench -p legos-app       # criterion 全链路延迟基准（feed→bus→book→strategy→risk→gateway）
 ```
 

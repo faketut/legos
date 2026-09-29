@@ -1,0 +1,18 @@
+[package]
+name = "legos-testnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "0 成本实盘验证积木：Binance Testnet 免费 WS 行情 + REST 下单（虚拟资金）"
+
+[dependencies]
+legos-core = { path = "../legos-core" }
+legos-book = { path = "../legos-book" }
+legos-risk = { path = "../legos-risk" }
+legos-strategy = { path = "../legos-strategy" }
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "2.10", features = ["tls"] }
+hmac = "0.12"
+sha2 = "0.10"
+serde_json = "1"

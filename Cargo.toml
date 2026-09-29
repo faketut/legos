@@ -8,6 +8,7 @@ members = [
     "legos-gateway",
     "legos-strategy",
     "legos-app",
+    "legos-testnet",
 ]
 resolver = "2"
 
