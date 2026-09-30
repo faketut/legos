@@ -143,13 +143,69 @@ cargo run -p legos-testnet --bin paper_trade -- BTCUSDT 500
 - 如所在地区打不开 `testnet.binance.vision`（如返回 451），
   `TestnetWsFeed::binance_mainnet` 可换用主网公开行情流做只读验证。
 
+## Demo 实录
+
+以下为真实录制的终端输出（非示意）。
+
+### Demo 1：本地回测——20 个 tick 走完六积木链路
+
+```bash
+$ cargo run -p legos-app --bin legos-app
+[legos-app] 主循环已绑定到 CPU 核心 0
+[legos-app] 回测数据源: legos-feed/data/sample_ticks.csv
+[legos-app] 回测完成: PipelineStats {
+    ticks: 20,
+    intents: 18,
+    sent: 18,
+    rejected_by_risk: 0,
+    rejected_by_gateway: 0,
+    fills: 0,
+    illegal_transitions: 0,
+}
+```
+
+解读：做市策略对 20 个 tick 产生 18 个交易意图，全部通过风控并送达模拟网关，订单状态机零非法转换。`fills: 0` 是因为示例数据的买卖报价没有交叉（模拟撮合只在交叉时成交）；链路本身已被 `intents`/`sent` 验证，成交路径的覆盖见单测与基准。
+
+### Demo 2：性能——1000 万 tick 的尾部延迟
+
+```bash
+$ cargo run --release -p legos-app --bin tail_latency
+tail_latency: N = 10000000 ticks
+pinned to core 1
+tsc_hz = 1.498e9 ticks/s (200ms sleep calibration)
+rdtsc overhead floor = 15 cycles (subtracted from every sample)
+warmup done (200000 ticks)
+fills = 9999996
+sort took 28.847599ms
++----------------+------------+
+| metric         | latency    |
++----------------+------------+
+| mean           |     35.8 ns |
+| p50            |     30.0 ns |
+| p99            |     70.1 ns |
+| p999           |    170.2 ns |
+| max            | 3169124.9 ns |
++----------------+------------+
+note: per-tick pipeline latency, in-process compute only (no network I/O).
+```
+
+解读：逐 tick 用 CPU 时间戳计数器计时并扣除计时器本底；p999 170.2ns，max 的 3.2ms 是共享虚拟机的调度噪声（见 PERF.md）。口径为纯进程内计算，不含网络 I/O。
+
+### Demo 3：Testnet 模拟盘
+
+见上文"0 成本实盘验证 → 第 2 步"。本机因 Binance 地理限制（451）无法录制，请在本地运行：
+
+```bash
+cargo run -p legos-testnet --bin paper_trade -- BTCUSDT 500
+```
+
 ## 构建 / 测试 / 运行
 
 需要 Rust 1.70+（本仓库用 rustup 安装，见环境备注）：
 
 ```bash
 cargo build --workspace        # 构建全部 9 个 crate
-cargo test --workspace         # 运行全部单测（77 个，含多线程 SPSC 压力测试）
+cargo test --workspace         # 运行全部单测（88 个，含多线程 SPSC 压力测试）
 cargo run -p legos-app         # 回测：CSV → 总线 → 账簿 → 做市策略 → 风控 → 模拟撮合
 cargo run -p legos-app -- data/btcusdt.csv   # 用 scripts/fetch_ticks.py 抓的真实数据回测
 cargo bench -p legos-app       # criterion 全链路延迟基准（feed→bus→book→strategy→risk→gateway）
